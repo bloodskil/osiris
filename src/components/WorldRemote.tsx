@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useCallback, useRef, useEffect } from 'react';
+import { useState, useCallback, useRef, useEffect, useMemo } from 'react';
 import { createPortal } from 'react-dom';
 
 import { motion, AnimatePresence } from 'framer-motion';
@@ -10,10 +10,11 @@ import {
   BatteryMedium, Fan, Eye, Send, Bell, BellOff, ChevronRight, Copy, Check,
   AlertTriangle, Scan, Zap, Unplug, Layers, ChevronDown, ChevronUp,
   Maximize2, Minimize2, Trash2, Pause, Play, Cpu, Printer,
-  ScanLine, Plug, Radio, Clock, Server, Terminal,
+  ScanLine, Plug, Radio, Clock, Server, Terminal, Square,
   MapPin, Download, Database, Crosshair, Navigation,
   Wifi, Globe, Target, Activity, Shield
 } from 'lucide-react';
+import { summarizeTrail, shouldLogFix, toGPX, formatDistance, formatDuration, type GpsFix } from '@/lib/gps-trail';
 
 /* ═══════════════════════════════════════════════════════════════
    M A R A U D E R   V 8
@@ -61,8 +62,11 @@ async function vaultDelete(id:string){const db=await openDB();return new Promise
 
 /* ═══════════════════════════════════════════════════════════════
    GPS MODULE
+   One fix, taken to tag a capture with where it happened. The
+   live trail built on it — watchPosition, distance, speed, GPX —
+   is in @/lib/gps-trail.
    ═══════════════════════════════════════════════════════════════ */
-interface GeoFix { lat:number; lng:number; acc:number; alt?:number; speed?:number; heading?:number; ts:number; }
+type GeoFix = GpsFix;
 function getGPS():Promise<GeoFix|null>{return new Promise(res=>{if(!navigator.geolocation){res(null);return;}navigator.geolocation.getCurrentPosition(p=>res({lat:p.coords.latitude,lng:p.coords.longitude,acc:p.coords.accuracy,alt:p.coords.altitude??undefined,speed:p.coords.speed??undefined,heading:p.coords.heading??undefined,ts:p.timestamp}),()=>res(null),{enableHighAccuracy:true,timeout:8000,maximumAge:5000});});}
 
 /* ═══════════════════════════════════════════════════════════════
@@ -105,11 +109,13 @@ interface Svc{uuid:string;name:string;chars:Chr[];}
 interface Chr{uuid:string;name:string;value?:string;hex?:string;notifying?:boolean;char?:BluetoothRemoteGATTCharacteristic;p:{r:boolean;w:boolean;wn:boolean;n:boolean;i:boolean};}
 
 const OP_CLR:Record<string,string>={SCAN:'#00E6FF',PROBE:'#B388FF',READ:'#64FFDA',WRITE:'#FFB800',NOTIFY:'#00FF88',CONNECT:'#00E6FF',DISCONNECT:'#FF6B6B',ENUM:'#80DEEA',ERROR:'#FF3D3D',SUB:'#FF6BCD',INFO:'#90A4AE',GPS:'#FFB74D',NET:'#80DEEA',RSSI:'#FF6BCD'};
+/* Trail cap: a long session must not grow the panel without bound. */
+const GPS_TRAIL_MAX=2000;
 
 /* ═══════════════════════════════════════════════════════════════
    COMPONENT
    ═══════════════════════════════════════════════════════════════ */
-export default function WorldRemote({onClose,onPlaceOnMap}:{onClose?:()=>void,onPlaceOnMap?:(devs:{id:string,name:string,lat:number,lng:number,type:string,color:string}[])=>void}){
+export default function WorldRemote({onClose,onPlaceOnMap}:{onClose?:()=>void,onPlaceOnMap?:(devs:{id:string,name:string,lat:number,lng:number,type:string,color:string,source?:string}[])=>void}){
   const [devices,setDevices]=useState<BLEDev[]>([]);
   const [scanning,setScanning]=useState(false);
   const [btOk,setBtOk]=useState(true);
@@ -133,10 +139,13 @@ export default function WorldRemote({onClose,onPlaceOnMap}:{onClose?:()=>void,on
   const [netLoading,setNetLoading]=useState(false);
   const [vaultCount,setVaultCount]=useState(0);
   const [vaultLoaded,setVaultLoaded]=useState(false);
+  const [gpsTrail,setGpsTrail]=useState<GeoFix[]>([]);
+  const [gpsTracking,setGpsTracking]=useState(false);
 
   const mtd=useRef(true);const errT=useRef<ReturnType<typeof setTimeout>|null>(null);
   const nL=useRef<Map<string,(e:Event)=>void>>(new Map());const pid=useRef(0);
   const logEl=useRef<HTMLDivElement>(null);const t0=useRef(Date.now());const[tick,setTick]=useState(0);
+  const gpsWatch=useRef<number|null>(null);const gpsTrailRef=useRef<GeoFix[]>([]);const gpsLogFix=useRef<GeoFix|null>(null);
 
 
   // Boot
@@ -147,7 +156,7 @@ export default function WorldRemote({onClose,onPlaceOnMap}:{onClose?:()=>void,on
       const restored=saved.map((d:any)=>({...d,connected:false,probing:false,srv:undefined,bt:undefined,rssiHistory:d.rssiHistory||[],gattDump:d.gattDump||[]}));
       setDevices(restored);setVaultCount(saved.length);setVaultLoaded(true);
     }else{setVaultLoaded(true);}}).catch(()=>setVaultLoaded(true));
-    return()=>{mtd.current=false;clearInterval(iv);if(errT.current)clearTimeout(errT.current);nL.current.clear();};
+    return()=>{mtd.current=false;clearInterval(iv);if(errT.current)clearTimeout(errT.current);nL.current.clear();if(gpsWatch.current!=null){try{navigator.geolocation.clearWatch(gpsWatch.current);}catch{}}};
   },[]);
   useEffect(()=>{if(autoScr&&logEl.current)logEl.current.scrollTop=logEl.current.scrollHeight;},[pkts,autoScr]);
   useEffect(()=>{if(full)document.body.style.overflow='hidden';else document.body.style.overflow='';return()=>{document.body.style.overflow='';};},[full]);
@@ -301,13 +310,55 @@ export default function WorldRemote({onClose,onPlaceOnMap}:{onClose?:()=>void,on
     if(mtd.current){setNetIntel(intel);setNetLoading(false);}
   },[netLoading,log]);
 
+  /* ═══ GPS TRAIL — the GPS MODULE, recorded ═══ */
+  const startGPSTrack=useCallback(()=>{
+    if(gpsTracking)return;
+    if(typeof navigator==='undefined'||!navigator.geolocation){setErr('This browser has no geolocation');return;}
+    setGpsTracking(true);gpsLogFix.current=null;
+    log('GPS','TRACKER','══ GPS TRAIL ══ watching position');
+    gpsWatch.current=navigator.geolocation.watchPosition(pos=>{
+      if(!mtd.current)return;
+      const fix:GeoFix={lat:pos.coords.latitude,lng:pos.coords.longitude,acc:pos.coords.accuracy,alt:pos.coords.altitude??undefined,speed:pos.coords.speed??undefined,heading:pos.coords.heading??undefined,ts:pos.timestamp||Date.now()};
+      setGpsTrail(prev=>{const next=prev.length>=GPS_TRAIL_MAX?[...prev.slice(prev.length-GPS_TRAIL_MAX+1),fix]:[...prev,fix];gpsTrailRef.current=next;return next;});
+      if(shouldLogFix(gpsLogFix.current,fix)){gpsLogFix.current=fix;log('GPS','TRACKER',`${fix.lat.toFixed(6)}, ${fix.lng.toFixed(6)} ±${Math.round(fix.acc)}m${fix.alt!=null?` alt:${Math.round(fix.alt)}m`:''}${fix.speed!=null?` ${(fix.speed*3.6).toFixed(1)}km/h`:''}${fix.heading!=null&&fix.heading>=0?` hdg:${Math.round(fix.heading)}°`:''}`);}
+    },e=>{
+      log('ERROR','TRACKER',`GPS error: ${e.message||'unavailable'}`);
+      setErr(`GPS: ${e.message||'unavailable'}`);
+      if(gpsWatch.current!=null){try{navigator.geolocation.clearWatch(gpsWatch.current);}catch{}gpsWatch.current=null;}
+      setGpsTracking(false);
+    },{enableHighAccuracy:true,maximumAge:2000,timeout:15000});
+  },[gpsTracking,log,setErr]);
+
+  const stopGPSTrack=useCallback(()=>{
+    if(gpsWatch.current!=null){try{navigator.geolocation.clearWatch(gpsWatch.current);}catch{}gpsWatch.current=null;}
+    setGpsTracking(false);
+    const s=summarizeTrail(gpsTrailRef.current);
+    log('GPS','TRACKER',`══ GPS TRAIL STOPPED — ${s.fixes} fix${s.fixes===1?'':'es'} · ${formatDistance(s.distanceM)} · ${formatDuration(s.durationMs)}`);
+  },[log]);
+
+  const exportGPX=useCallback(()=>{
+    if(gpsTrail.length===0)return;
+    const s=summarizeTrail(gpsTrail);
+    const blob=new Blob([toGPX(gpsTrail)],{type:'application/gpx+xml'});
+    const url=URL.createObjectURL(blob);const a=document.createElement('a');a.href=url;a.download=`marauder_track_${new Date().toISOString().replace(/[:.]/g,'-')}.gpx`;a.click();URL.revokeObjectURL(url);
+    log('INFO','EXPORT',`Exported GPS trail — ${s.fixes} fixes, ${formatDistance(s.distanceM)}`);
+  },[gpsTrail,log]);
+
+  /* The trail on the OSIRIS globe: at most 20 marks, evenly spaced. */
+  const placeTrailOnMap=useCallback(()=>{
+    if(!onPlaceOnMap||gpsTrail.length===0)return;
+    const MAX_MARKS=20;const step=Math.max(1,Math.ceil(gpsTrail.length/MAX_MARKS));
+    const marks=gpsTrail.filter((_,i)=>i%step===0).slice(-MAX_MARKS).map((f,i)=>({id:`gps-fix-${f.ts}-${i}`,name:`GPS ${i+1}`,lat:f.lat,lng:f.lng,type:'GPS FIX',color:'#FFB74D',source:'GPS'}));
+    onPlaceOnMap(marks);
+  },[gpsTrail,onPlaceOnMap]);
+
   /* ═══ EXPORT ═══ */
   const exportJSON=useCallback(()=>{
-    const payload={version:'marauder_v8',exported:new Date().toISOString(),devices:devices.map(d=>({...d,bt:undefined,srv:undefined})),network:netIntel,packetCount:pkts.length,totalBytes:bytes};
+    const payload={version:'marauder_v8',exported:new Date().toISOString(),devices:devices.map(d=>({...d,bt:undefined,srv:undefined})),network:netIntel,gps:{stats:summarizeTrail(gpsTrail),trail:gpsTrail},packetCount:pkts.length,totalBytes:bytes};
     const blob=new Blob([JSON.stringify(payload,null,2)],{type:'application/json'});
     const url=URL.createObjectURL(blob);const a=document.createElement('a');a.href=url;a.download=`marauder_${new Date().toISOString().replace(/[:.]/g,'-')}.json`;a.click();URL.revokeObjectURL(url);
     log('INFO','EXPORT',`Exported ${devices.length} devices to JSON`);
-  },[devices,netIntel,pkts.length,bytes,log]);
+  },[devices,netIntel,gpsTrail,pkts.length,bytes,log]);
   const exportCSV=useCallback(()=>{
     const rows=[['Name','Type','Manufacturer','Model','Serial','Battery','TX Power','Services','Chars','Bytes','Lat','Lng','GPS Acc','Captured'].join(',')];
     devices.forEach(d=>rows.push([d.name,d.type,d.manufacturer||'',d.model||'',d.serial||'',d.battery!=null?String(d.battery):'',d.txPower!=null?String(d.txPower):'',String(d.serviceCount),String(d.charCount),String(d.totalBytes),d.geo?d.geo.lat.toFixed(6):'',d.geo?d.geo.lng.toFixed(6):'',d.geo?String(Math.round(d.geo.acc)):'',new Date(d.capturedAt).toISOString()].map(v=>`"${v}"`).join(',')));
@@ -319,6 +370,8 @@ export default function WorldRemote({onClose,onPlaceOnMap}:{onClose?:()=>void,on
   const upSec=Math.floor((Date.now()-t0.current)/1000);const upStr=`${Math.floor(upSec/60).toString().padStart(2,'0')}:${(upSec%60).toString().padStart(2,'0')}`;
   const liveCount=devices.filter(d=>d.connected).length;
   const geoCount=devices.filter(d=>d.geo).length;
+  const gpsStats=useMemo(()=>summarizeTrail(gpsTrail),[gpsTrail]);
+  const lastFix=gpsTrail.length>0?gpsTrail[gpsTrail.length-1]:null;
 
   /* ═══════════════════════════════════════════════════════════════
      R E N D E R
@@ -484,6 +537,27 @@ export default function WorldRemote({onClose,onPlaceOnMap}:{onClose?:()=>void,on
             {/* ═══ INTEL TAB ═══ */}
             {view==='intel'&&(
               <div className="flex-1 overflow-y-auto styled-scrollbar p-2.5 space-y-2.5">
+                {/* GPS Trail — the GPS MODULE, recorded */}
+                <div className="rounded-xl overflow-hidden" style={{background:'rgba(255,255,255,0.015)',border:'1px solid rgba(255,255,255,0.04)'}}>
+                  <div className="px-3 py-2 flex items-center justify-between" style={{borderBottom:'1px solid rgba(255,255,255,0.03)'}}>
+                    <div className="flex items-center gap-1.5"><Navigation className="w-3 h-3 text-[#FFB74D]"/><span className="text-[9px] font-mono font-bold tracking-[0.12em] text-[var(--text-primary)]">GPS TRAIL</span>{gpsTracking&&<span className="text-[9px] font-mono font-bold tracking-widest text-[#FFB74D] animate-pulse">● REC</span>}</div>
+                    <motion.button whileTap={{scale:0.95}} onClick={gpsTracking?stopGPSTrack:startGPSTrack} className="px-2 py-0.5 rounded text-[9px] font-mono font-bold tracking-wider flex items-center gap-1" style={gpsTracking?{background:'rgba(255,61,61,0.06)',color:'#FF6B6B',border:'1px solid rgba(255,61,61,0.08)'}:{background:'rgba(255,183,77,0.06)',color:'#FFB74D',border:'1px solid rgba(255,183,77,0.08)'}}>{gpsTracking?<><Square className="w-2 h-2"/>STOP</>:<><Crosshair className="w-2 h-2"/>TRACK</>}</motion.button>
+                  </div>
+                  {gpsTrail.length===0&&!gpsTracking&&<div className="px-3 py-4 text-center"><span className="text-[9px] font-mono text-[var(--text-muted)] opacity-30">Tap TRACK to record a live GPS trail</span></div>}
+                  {gpsTracking&&gpsTrail.length===0&&<div className="px-3 py-4 text-center"><span className="text-[9px] font-mono text-[#FFB74D] opacity-60 animate-pulse">Waiting for first fix…</span></div>}
+                  {gpsTrail.length>0&&<div className="p-2.5 space-y-2">
+                    {lastFix&&<div className="flex gap-3 flex-wrap">
+                      {([{l:'LAT',v:lastFix.lat.toFixed(6)},{l:'LNG',v:lastFix.lng.toFixed(6)},{l:'±ACC',v:`${Math.round(lastFix.acc)}m`},{l:'ALT',v:lastFix.alt!=null?`${Math.round(lastFix.alt)}m`:undefined},{l:'SPD',v:lastFix.speed!=null?`${(lastFix.speed*3.6).toFixed(1)}km/h`:undefined},{l:'HDG',v:lastFix.heading!=null&&lastFix.heading>=0?`${Math.round(lastFix.heading)}°`:undefined}] as {l:string,v:string|undefined}[]).filter(x=>x.v).map(x=><div key={x.l}><div className="text-[9px] font-mono text-[var(--text-muted)] tracking-wider">{x.l}</div><div className="text-[10px] font-mono text-[var(--text-primary)] font-bold">{x.v}</div></div>)}
+                    </div>}
+                    <div className="flex gap-3 flex-wrap">
+                      {[{l:'FIXES',v:String(gpsStats.fixes)},{l:'DIST',v:formatDistance(gpsStats.distanceM)},{l:'TIME',v:formatDuration(gpsStats.durationMs)},{l:'MAX',v:`${(gpsStats.maxSpeedMps*3.6).toFixed(1)}km/h`}].map(x=><div key={x.l}><div className="text-[9px] font-mono text-[var(--text-muted)] tracking-wider">{x.l}</div><div className="text-[10px] font-mono text-[var(--text-primary)] font-bold">{x.v}</div></div>)}
+                    </div>
+                    <div className="flex gap-1.5">
+                      <motion.button whileTap={{scale:0.95}} onClick={exportGPX} className="flex-1 py-1.5 rounded-lg text-[9px] font-mono font-bold tracking-wider flex items-center justify-center gap-1" style={{background:'rgba(255,183,77,0.06)',color:'#FFB74D',border:'1px solid rgba(255,183,77,0.08)'}}><Download className="w-2.5 h-2.5"/>EXPORT GPX</motion.button>
+                      <motion.button whileTap={{scale:0.95}} onClick={placeTrailOnMap} disabled={!onPlaceOnMap} className="flex-1 py-1.5 rounded-lg text-[9px] font-mono font-bold tracking-wider flex items-center justify-center gap-1 disabled:opacity-30" style={{background:'rgba(0,230,255,0.06)',color:'var(--cyan-primary)',border:'1px solid rgba(0,230,255,0.08)'}}><MapPin className="w-2.5 h-2.5"/>ON MAP</motion.button>
+                    </div>
+                  </div>}
+                </div>
                 {/* Network Recon */}
                 <div className="rounded-xl overflow-hidden" style={{background:'rgba(255,255,255,0.015)',border:'1px solid rgba(255,255,255,0.04)'}}>
                   <div className="px-3 py-2 flex items-center justify-between" style={{borderBottom:'1px solid rgba(255,255,255,0.03)'}}>
