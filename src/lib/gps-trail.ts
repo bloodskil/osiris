@@ -7,7 +7,9 @@
  * answers what the tracker panel shows — how far the trail has run, how fast
  * it moved, how long it recorded — and serialises the trail as GPX so it can
  * be opened in any GIS tool afterwards. `parseGPX` is the other direction: a
- * trail recorded elsewhere, read back in.
+ * trail recorded elsewhere, read back in. `sampleTrail` answers where the
+ * trail was at a moment — what the replay strip scrubs — and `plotTrail`
+ * turns the fixes into a tiny normalised preview of the route.
  *
  * It is pure on purpose: no geolocation, no timers, no DOM. Everything the
  * browser adds (accuracy, timestamp) enters as data, which is what makes the
@@ -214,4 +216,111 @@ export function parseGPX(xml: string): GpxImport {
     });
   }
   return { fixes, skipped };
+}
+
+/* ── Replay — where the trail was at a moment ── */
+
+export interface TrailSample {
+  lat: number;
+  lng: number;
+  alt?: number;
+  speed?: number;
+  /** Elapsed milliseconds from the first fix, clamped to the trail's span. */
+  t: number;
+  /** 0..1 along the trail's timeline. */
+  progress: number;
+  /** Index of the segment's opening fix, for "fix i of n" readouts. */
+  index: number;
+}
+
+/** A bare sample at one known fix, sharing the caller's clock. */
+function bareSample(fixes: GpsFix[], i: number, t: number, progress: number): TrailSample {
+  const f = fixes[i];
+  return { lat: f.lat, lng: f.lng, alt: f.alt, speed: f.speed, t, progress, index: i };
+}
+
+/**
+ * Where was the operator `elapsedMs` after the first fix? The replay strip
+ * scrubs this. Between two fixes the position is interpolated; altitude is
+ * interpolated when both ends carry one, a hardware speed is not invented
+ * but carried from the later fix when it exists. Out-of-order or repeated
+ * timestamps return a real fix from the trail rather than nonsense — the
+ * same inputs `summarizeTrail` already tolerates.
+ */
+export function sampleTrail(fixes: GpsFix[], elapsedMs: number): TrailSample | null {
+  if (fixes.length === 0) return null;
+  const duration = Math.max(0, fixes[fixes.length - 1].ts - fixes[0].ts);
+  const t = Math.max(0, Math.min(Number.isFinite(elapsedMs) ? elapsedMs : 0, duration));
+  const progress = duration > 0 ? t / duration : 1;
+  if (duration === 0 || fixes.length === 1) return bareSample(fixes, fixes.length - 1, t, progress);
+  if (t === 0) return bareSample(fixes, 0, t, progress);
+  if (t === duration) return bareSample(fixes, fixes.length - 1, t, progress);
+  const tAbs = fixes[0].ts + t;
+  for (let i = 1; i < fixes.length; i++) {
+    const a = fixes[i - 1];
+    const b = fixes[i];
+    const dt = b.ts - a.ts;
+    if (dt <= 0 || tAbs < a.ts || tAbs > b.ts) continue;
+    const f = (tAbs - a.ts) / dt;
+    const bothAlt = a.alt != null && b.alt != null;
+    return {
+      lat: a.lat + (b.lat - a.lat) * f,
+      lng: a.lng + (b.lng - a.lng) * f,
+      alt: bothAlt ? a.alt! + (b.alt! - a.alt!) * f : a.alt ?? b.alt,
+      speed: b.speed ?? a.speed,
+      t,
+      progress,
+      index: i - 1,
+    };
+  }
+  return bareSample(fixes, fixes.length - 1, t, progress);
+}
+
+export interface TrailPlot {
+  /** `"x,y x,y …"` for an SVG <polyline> in the width×height space. */
+  points: string;
+  /** The same projection, for placing a dot on a sample between fixes. */
+  project: (lat: number, lng: number) => { x: number; y: number };
+  /** True when every fix sits on the same spot — a dot, not a route. */
+  degenerate: boolean;
+}
+
+/**
+ * The trail as a tiny normalised drawing: a north-up box of the given size,
+ * the route centred inside it with padding and drawn with the same aspect
+ * correction the globe applies (a degree of longitude shrinks with latitude).
+ */
+export function plotTrail(fixes: GpsFix[], width = 100, height = 40, pad = 4): TrailPlot {
+  if (fixes.length === 0) {
+    const x = width / 2;
+    const y = height / 2;
+    return { points: '', project: () => ({ x, y }), degenerate: true };
+  }
+  let minLat = Infinity, maxLat = -Infinity, minLng = Infinity, maxLng = -Infinity;
+  for (const f of fixes) {
+    minLat = Math.min(minLat, f.lat);
+    maxLat = Math.max(maxLat, f.lat);
+    minLng = Math.min(minLng, f.lng);
+    maxLng = Math.max(maxLng, f.lng);
+  }
+  const midLat = (minLat + maxLat) / 2;
+  const kx = Math.max(1e-9, Math.cos((midLat * Math.PI) / 180));
+  const spanX = (maxLng - minLng) * kx;
+  const spanY = maxLat - minLat;
+  const availW = Math.max(1, width - pad * 2);
+  const availH = Math.max(1, height - pad * 2);
+  const scale = Math.min(availW / Math.max(spanX, 1e-12), availH / Math.max(spanY, 1e-12));
+  const drawnW = spanX * scale;
+  const drawnH = spanY * scale;
+  const offX = pad + (availW - drawnW) / 2;
+  const offY = pad + (availH - drawnH) / 2;
+  const project = (lat: number, lng: number) => ({
+    x: offX + (lng - minLng) * kx * scale,
+    y: offY + (maxLat - lat) * scale,
+  });
+  const points = fixes.map(f => {
+    const p = project(f.lat, f.lng);
+    return `${p.x.toFixed(2)},${p.y.toFixed(2)}`;
+  }).join(' ');
+  return { points, project, degenerate: spanX < 1e-12 && spanY < 1e-12 };
 }
