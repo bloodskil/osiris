@@ -5,6 +5,7 @@ import {
   formatDistance,
   formatDuration,
   toGPX,
+  parseGPX,
   type GpsFix,
 } from './gps-trail';
 import { distanceM } from './navigation';
@@ -165,5 +166,80 @@ describe('toGPX', () => {
   it('escapes the track name and uses the default when none is given', () => {
     expect(toGPX([], 'Dock 5 & <Bridge>')).toContain('<name>Dock 5 &amp; &lt;Bridge&gt;</name>');
     expect(toGPX([])).toContain('<name>OSIRIS Marauder GPS trail</name>');
+  });
+});
+
+describe('parseGPX', () => {
+  it('round-trips the exporter: coordinates, altitude and times come back', () => {
+    const src = [
+      fix(52.5163, 13.3777, Date.UTC(2026, 9, 18, 12, 0, 0), { alt: 34.5 }),
+      fix(52.5168, 13.3798, Date.UTC(2026, 9, 18, 12, 0, 30)),
+    ];
+    const { fixes, skipped } = parseGPX(toGPX(src));
+    expect(skipped).toBe(0);
+    expect(fixes).toHaveLength(2);
+    expect(fixes[0].lat).toBeCloseTo(52.5163, 6);
+    expect(fixes[0].lng).toBeCloseTo(13.3777, 6);
+    expect(fixes[0].alt).toBeCloseTo(34.5, 1);
+    expect(fixes[0].ts).toBe(Date.UTC(2026, 9, 18, 12, 0, 0));
+    expect(fixes[1].alt).toBeUndefined();
+  });
+
+  it('reads route points as well as track points, in document order', () => {
+    const xml =
+      '<gpx><trk><trkseg><trkpt lat="10" lon="20"><time>2026-10-18T12:00:00Z</time></trkpt></trkseg></trk>' +
+      '<rte><rtept lat="11" lon="21"/></rte></gpx>';
+    const { fixes } = parseGPX(xml);
+    expect(fixes.map(f => [f.lat, f.lng])).toEqual([[10, 20], [11, 21]]);
+  });
+
+  it('tolerates namespace prefixes on both sides of the tags', () => {
+    const xml = '<gpx:trkpt lat="10" lon="20"><gpx:ele>120.5</gpx:ele></gpx:trkpt>';
+    const { fixes } = parseGPX(xml);
+    expect(fixes).toHaveLength(1);
+    expect(fixes[0].alt).toBeCloseTo(120.5, 1);
+  });
+
+  it('drops points without usable coordinates and counts them', () => {
+    const xml =
+      '<gpx><trkpt lat="91.5" lon="0"/><trkpt lon="0"/><trkpt lat="abc" lon="0"/>' +
+      '<trkpt lat="10" lon="-190"/><trkpt lat="10" lon="20.5"/></gpx>';
+    const { fixes, skipped } = parseGPX(xml);
+    expect(skipped).toBe(4);
+    expect(fixes.map(f => [f.lat, f.lng])).toEqual([[10, 20.5]]);
+  });
+
+  it('reads self-closed points and single-quoted attributes', () => {
+    const { fixes } = parseGPX("<gpx><trkpt lat='10.25' lon='20.5'/></gpx>");
+    expect(fixes.map(f => [f.lat, f.lng])).toEqual([[10.25, 20.5]]);
+  });
+
+  it('accepts lng as an alias of lon', () => {
+    const { fixes } = parseGPX('<gpx><trkpt lat="10" lng="20"/></gpx>');
+    expect(fixes.map(f => [f.lat, f.lng])).toEqual([[10, 20]]);
+  });
+
+  it('leaves the timestamp at 0 when time is absent or unparseable', () => {
+    const { fixes } = parseGPX(
+      '<gpx><trkpt lat="1" lon="2"/><trkpt lat="3" lon="4"><time>not-a-date</time></trkpt></gpx>',
+    );
+    expect(fixes.map(f => f.ts)).toEqual([0, 0]);
+  });
+
+  it('keeps a point whose ele is unreadable, dropping only the altitude', () => {
+    const { fixes } = parseGPX('<gpx><trkpt lat="1" lon="2"><ele>high</ele></trkpt></gpx>');
+    expect(fixes).toHaveLength(1);
+    expect(fixes[0].alt).toBeUndefined();
+  });
+
+  it('finds nothing, and does not throw, in a document without track points', () => {
+    expect(parseGPX('<html><body>not a gpx</body></html>')).toEqual({ fixes: [], skipped: 0 });
+    expect(parseGPX('')).toEqual({ fixes: [], skipped: 0 });
+  });
+
+  it('ignores waypoints — they are not track points', () => {
+    const { fixes, skipped } = parseGPX('<gpx><wpt lat="10" lon="20"><name>Dock 5</name></wpt></gpx>');
+    expect(fixes).toEqual([]);
+    expect(skipped).toBe(0);
   });
 });

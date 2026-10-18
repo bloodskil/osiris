@@ -11,10 +11,10 @@ import {
   AlertTriangle, Scan, Zap, Unplug, Layers, ChevronDown, ChevronUp,
   Maximize2, Minimize2, Trash2, Pause, Play, Cpu, Printer,
   ScanLine, Plug, Radio, Clock, Server, Terminal, Square,
-  MapPin, Download, Database, Crosshair, Navigation,
+  MapPin, Download, Upload, Database, Crosshair, Navigation,
   Wifi, Globe, Target, Activity, Shield
 } from 'lucide-react';
-import { summarizeTrail, shouldLogFix, toGPX, formatDistance, formatDuration, type GpsFix } from '@/lib/gps-trail';
+import { summarizeTrail, shouldLogFix, toGPX, parseGPX, formatDistance, formatDuration, type GpsFix } from '@/lib/gps-trail';
 
 /* ═══════════════════════════════════════════════════════════════
    M A R A U D E R   V 8
@@ -145,7 +145,7 @@ export default function WorldRemote({onClose,onPlaceOnMap}:{onClose?:()=>void,on
   const mtd=useRef(true);const errT=useRef<ReturnType<typeof setTimeout>|null>(null);
   const nL=useRef<Map<string,(e:Event)=>void>>(new Map());const pid=useRef(0);
   const logEl=useRef<HTMLDivElement>(null);const t0=useRef(Date.now());const[tick,setTick]=useState(0);
-  const gpsWatch=useRef<number|null>(null);const gpsTrailRef=useRef<GeoFix[]>([]);const gpsLogFix=useRef<GeoFix|null>(null);
+  const gpsWatch=useRef<number|null>(null);const gpsTrailRef=useRef<GeoFix[]>([]);const gpsLogFix=useRef<GeoFix|null>(null);const gpsFileRef=useRef<HTMLInputElement|null>(null);
 
 
   // Boot
@@ -194,7 +194,7 @@ export default function WorldRemote({onClose,onPlaceOnMap}:{onClose?:()=>void,on
     // GPS tag
     log('GPS','SCANNER','Acquiring GPS fix...');
     const geo=await getGPS();
-    if(geo)log('GPS','SCANNER',`Fix: ${geo.lat.toFixed(6)}, ${geo.lng.toFixed(6)} (±${Math.round(geo.acc)}m)${geo.alt!=null?` alt:${Math.round(geo.alt)}m`:''}${geo.speed!=null?` ${(geo.speed*3.6).toFixed(1)}km/h`:''}`);
+    if(geo)log('GPS','SCANNER',`Fix: ${geo.lat.toFixed(6)}, ${geo.lng.toFixed(6)}${geo.acc!=null?` (±${Math.round(geo.acc)}m)`:''}${geo.alt!=null?` alt:${Math.round(geo.alt)}m`:''}${geo.speed!=null?` ${(geo.speed*3.6).toFixed(1)}km/h`:''}`);
     else log('GPS','SCANNER','No GPS available');
 
     log('PROBE',dev.name,'══ DEEP PROBE + AUTO-VACUUM ══');
@@ -320,7 +320,7 @@ export default function WorldRemote({onClose,onPlaceOnMap}:{onClose?:()=>void,on
       if(!mtd.current)return;
       const fix:GeoFix={lat:pos.coords.latitude,lng:pos.coords.longitude,acc:pos.coords.accuracy,alt:pos.coords.altitude??undefined,speed:pos.coords.speed??undefined,heading:pos.coords.heading??undefined,ts:pos.timestamp||Date.now()};
       setGpsTrail(prev=>{const next=prev.length>=GPS_TRAIL_MAX?[...prev.slice(prev.length-GPS_TRAIL_MAX+1),fix]:[...prev,fix];gpsTrailRef.current=next;return next;});
-      if(shouldLogFix(gpsLogFix.current,fix)){gpsLogFix.current=fix;log('GPS','TRACKER',`${fix.lat.toFixed(6)}, ${fix.lng.toFixed(6)} ±${Math.round(fix.acc)}m${fix.alt!=null?` alt:${Math.round(fix.alt)}m`:''}${fix.speed!=null?` ${(fix.speed*3.6).toFixed(1)}km/h`:''}${fix.heading!=null&&fix.heading>=0?` hdg:${Math.round(fix.heading)}°`:''}`);}
+      if(shouldLogFix(gpsLogFix.current,fix)){gpsLogFix.current=fix;log('GPS','TRACKER',`${fix.lat.toFixed(6)}, ${fix.lng.toFixed(6)}${fix.acc!=null?` ±${Math.round(fix.acc)}m`:''}${fix.alt!=null?` alt:${Math.round(fix.alt)}m`:''}${fix.speed!=null?` ${(fix.speed*3.6).toFixed(1)}km/h`:''}${fix.heading!=null&&fix.heading>=0?` hdg:${Math.round(fix.heading)}°`:''}`);}
     },e=>{
       log('ERROR','TRACKER',`GPS error: ${e.message||'unavailable'}`);
       setErr(`GPS: ${e.message||'unavailable'}`);
@@ -335,6 +335,21 @@ export default function WorldRemote({onClose,onPlaceOnMap}:{onClose?:()=>void,on
     const s=summarizeTrail(gpsTrailRef.current);
     log('GPS','TRACKER',`══ GPS TRAIL STOPPED — ${s.fixes} fix${s.fixes===1?'':'es'} · ${formatDistance(s.distanceM)} · ${formatDuration(s.durationMs)}`);
   },[log]);
+
+  /* Import a recorded trail — the other direction of EXPORT GPX. It replaces
+     the current trail: stitching maps recorded at different times would
+     fabricate the distance between them. */
+  const importGPXFile=useCallback(async(file:File)=>{
+    if(gpsTracking)return;
+    try{
+      const {fixes,skipped}=parseGPX(await file.text());
+      if(fixes.length===0){setErr('GPX: no track points found');log('ERROR','TRACKER',`GPX import failed — no track points in "${file.name}"`);return;}
+      const capped=fixes.length>GPS_TRAIL_MAX?fixes.slice(fixes.length-GPS_TRAIL_MAX):fixes;
+      gpsTrailRef.current=capped;gpsLogFix.current=null;setGpsTrail(capped);
+      const s=summarizeTrail(capped);
+      log('GPS','TRACKER',`══ GPX IMPORTED — "${file.name}" · ${s.fixes} fix${s.fixes===1?'':'es'} · ${formatDistance(s.distanceM)} · ${formatDuration(s.durationMs)}${skipped>0?` · ${skipped} skipped`:''}`);
+    }catch(e:any){setErr(`GPX: ${e?.message||'unreadable'}`);log('ERROR','TRACKER',`GPX import failed: ${e?.message||'unreadable'}`);}
+  },[gpsTracking,log,setErr]);
 
   const exportGPX=useCallback(()=>{
     if(gpsTrail.length===0)return;
@@ -361,7 +376,7 @@ export default function WorldRemote({onClose,onPlaceOnMap}:{onClose?:()=>void,on
   },[devices,netIntel,gpsTrail,pkts.length,bytes,log]);
   const exportCSV=useCallback(()=>{
     const rows=[['Name','Type','Manufacturer','Model','Serial','Battery','TX Power','Services','Chars','Bytes','Lat','Lng','GPS Acc','Captured'].join(',')];
-    devices.forEach(d=>rows.push([d.name,d.type,d.manufacturer||'',d.model||'',d.serial||'',d.battery!=null?String(d.battery):'',d.txPower!=null?String(d.txPower):'',String(d.serviceCount),String(d.charCount),String(d.totalBytes),d.geo?d.geo.lat.toFixed(6):'',d.geo?d.geo.lng.toFixed(6):'',d.geo?String(Math.round(d.geo.acc)):'',new Date(d.capturedAt).toISOString()].map(v=>`"${v}"`).join(',')));
+    devices.forEach(d=>rows.push([d.name,d.type,d.manufacturer||'',d.model||'',d.serial||'',d.battery!=null?String(d.battery):'',d.txPower!=null?String(d.txPower):'',String(d.serviceCount),String(d.charCount),String(d.totalBytes),d.geo?d.geo.lat.toFixed(6):'',d.geo?d.geo.lng.toFixed(6):'',d.geo&&d.geo.acc!=null?String(Math.round(d.geo.acc)):'',new Date(d.capturedAt).toISOString()].map(v=>`"${v}"`).join(',')));
     const blob=new Blob([rows.join('\n')],{type:'text/csv'});const url=URL.createObjectURL(blob);const a=document.createElement('a');a.href=url;a.download=`marauder_${new Date().toISOString().replace(/[:.]/g,'-')}.csv`;a.click();URL.revokeObjectURL(url);
     log('INFO','EXPORT',`Exported ${devices.length} devices to CSV`);
   },[devices,log]);
@@ -481,7 +496,7 @@ export default function WorldRemote({onClose,onPlaceOnMap}:{onClose?:()=>void,on
                             {[{k:'Manufacturer',v:dev.manufacturer},{k:'Model',v:dev.model},{k:'Serial',v:dev.serial},{k:'Firmware',v:dev.firmware},{k:'TX Power',v:dev.txPower!=null?`${dev.txPower} dBm`:undefined}].filter(x=>x.v).map(x=>(
                               <div key={x.k} className="flex gap-2"><span className="text-[9px] font-mono text-[var(--text-muted)] w-[65px] shrink-0 tracking-wider">{x.k}</span><span className="text-[9px] font-mono text-[var(--text-primary)] truncate">{x.v}</span></div>
                             ))}
-                            {dev.geo&&<div className="flex gap-2"><span className="text-[9px] font-mono text-[var(--text-muted)] w-[65px] shrink-0 tracking-wider">GPS</span><span className="text-[9px] font-mono text-[#FFB74D]">{dev.geo.lat.toFixed(5)}, {dev.geo.lng.toFixed(5)} ±{Math.round(dev.geo.acc)}m</span></div>}
+                            {dev.geo&&<div className="flex gap-2"><span className="text-[9px] font-mono text-[var(--text-muted)] w-[65px] shrink-0 tracking-wider">GPS</span><span className="text-[9px] font-mono text-[#FFB74D]">{dev.geo.lat.toFixed(5)}, {dev.geo.lng.toFixed(5)}{dev.geo.acc!=null?` ±${Math.round(dev.geo.acc)}m`:''}</span></div>}
                             <div className="flex gap-2"><span className="text-[9px] font-mono text-[var(--text-muted)] w-[65px] shrink-0 tracking-wider">Extracted</span><span className="text-[9px] font-mono text-[var(--text-muted)]">{dev.serviceCount}svcs · {dev.charCount}chars · {dev.gattDump.length}vals · {dev.totalBytes}B</span></div>
                           </div>
                         </div>
@@ -543,16 +558,21 @@ export default function WorldRemote({onClose,onPlaceOnMap}:{onClose?:()=>void,on
                     <div className="flex items-center gap-1.5"><Navigation className="w-3 h-3 text-[#FFB74D]"/><span className="text-[9px] font-mono font-bold tracking-[0.12em] text-[var(--text-primary)]">GPS TRAIL</span>{gpsTracking&&<span className="text-[9px] font-mono font-bold tracking-widest text-[#FFB74D] animate-pulse">● REC</span>}</div>
                     <motion.button whileTap={{scale:0.95}} onClick={gpsTracking?stopGPSTrack:startGPSTrack} className="px-2 py-0.5 rounded text-[9px] font-mono font-bold tracking-wider flex items-center gap-1" style={gpsTracking?{background:'rgba(255,61,61,0.06)',color:'#FF6B6B',border:'1px solid rgba(255,61,61,0.08)'}:{background:'rgba(255,183,77,0.06)',color:'#FFB74D',border:'1px solid rgba(255,183,77,0.08)'}}>{gpsTracking?<><Square className="w-2 h-2"/>STOP</>:<><Crosshair className="w-2 h-2"/>TRACK</>}</motion.button>
                   </div>
-                  {gpsTrail.length===0&&!gpsTracking&&<div className="px-3 py-4 text-center"><span className="text-[9px] font-mono text-[var(--text-muted)] opacity-30">Tap TRACK to record a live GPS trail</span></div>}
+                  <input ref={gpsFileRef} type="file" accept=".gpx,application/gpx+xml,text/xml" className="hidden" onChange={e=>{const f=e.target.files?.[0];e.target.value='';if(f)importGPXFile(f);}}/>
+                  {gpsTrail.length===0&&!gpsTracking&&<div className="px-3 py-3 text-center space-y-2">
+                    <div className="text-[9px] font-mono text-[var(--text-muted)] opacity-30">Tap TRACK to record a live GPS trail — or import one</div>
+                    <motion.button whileTap={{scale:0.95}} onClick={()=>gpsFileRef.current?.click()} className="inline-flex items-center gap-1 py-1 px-2.5 rounded text-[9px] font-mono font-bold tracking-wider" style={{background:'rgba(255,183,77,0.06)',color:'#FFB74D',border:'1px solid rgba(255,183,77,0.08)'}}><Upload className="w-2.5 h-2.5"/>IMPORT GPX</motion.button>
+                  </div>}
                   {gpsTracking&&gpsTrail.length===0&&<div className="px-3 py-4 text-center"><span className="text-[9px] font-mono text-[#FFB74D] opacity-60 animate-pulse">Waiting for first fix…</span></div>}
                   {gpsTrail.length>0&&<div className="p-2.5 space-y-2">
                     {lastFix&&<div className="flex gap-3 flex-wrap">
-                      {([{l:'LAT',v:lastFix.lat.toFixed(6)},{l:'LNG',v:lastFix.lng.toFixed(6)},{l:'±ACC',v:`${Math.round(lastFix.acc)}m`},{l:'ALT',v:lastFix.alt!=null?`${Math.round(lastFix.alt)}m`:undefined},{l:'SPD',v:lastFix.speed!=null?`${(lastFix.speed*3.6).toFixed(1)}km/h`:undefined},{l:'HDG',v:lastFix.heading!=null&&lastFix.heading>=0?`${Math.round(lastFix.heading)}°`:undefined}] as {l:string,v:string|undefined}[]).filter(x=>x.v).map(x=><div key={x.l}><div className="text-[9px] font-mono text-[var(--text-muted)] tracking-wider">{x.l}</div><div className="text-[10px] font-mono text-[var(--text-primary)] font-bold">{x.v}</div></div>)}
+                      {([{l:'LAT',v:lastFix.lat.toFixed(6)},{l:'LNG',v:lastFix.lng.toFixed(6)},{l:'±ACC',v:lastFix.acc!=null?`${Math.round(lastFix.acc)}m`:undefined},{l:'ALT',v:lastFix.alt!=null?`${Math.round(lastFix.alt)}m`:undefined},{l:'SPD',v:lastFix.speed!=null?`${(lastFix.speed*3.6).toFixed(1)}km/h`:undefined},{l:'HDG',v:lastFix.heading!=null&&lastFix.heading>=0?`${Math.round(lastFix.heading)}°`:undefined}] as {l:string,v:string|undefined}[]).filter(x=>x.v).map(x=><div key={x.l}><div className="text-[9px] font-mono text-[var(--text-muted)] tracking-wider">{x.l}</div><div className="text-[10px] font-mono text-[var(--text-primary)] font-bold">{x.v}</div></div>)}
                     </div>}
                     <div className="flex gap-3 flex-wrap">
                       {[{l:'FIXES',v:String(gpsStats.fixes)},{l:'DIST',v:formatDistance(gpsStats.distanceM)},{l:'TIME',v:formatDuration(gpsStats.durationMs)},{l:'MAX',v:`${(gpsStats.maxSpeedMps*3.6).toFixed(1)}km/h`}].map(x=><div key={x.l}><div className="text-[9px] font-mono text-[var(--text-muted)] tracking-wider">{x.l}</div><div className="text-[10px] font-mono text-[var(--text-primary)] font-bold">{x.v}</div></div>)}
                     </div>
                     <div className="flex gap-1.5">
+                      <motion.button whileTap={{scale:0.95}} onClick={()=>gpsFileRef.current?.click()} disabled={gpsTracking} className="flex-1 py-1.5 rounded-lg text-[9px] font-mono font-bold tracking-wider flex items-center justify-center gap-1 disabled:opacity-30" style={{background:'rgba(255,183,77,0.06)',color:'#FFB74D',border:'1px solid rgba(255,183,77,0.08)'}}><Upload className="w-2.5 h-2.5"/>IMPORT</motion.button>
                       <motion.button whileTap={{scale:0.95}} onClick={exportGPX} className="flex-1 py-1.5 rounded-lg text-[9px] font-mono font-bold tracking-wider flex items-center justify-center gap-1" style={{background:'rgba(255,183,77,0.06)',color:'#FFB74D',border:'1px solid rgba(255,183,77,0.08)'}}><Download className="w-2.5 h-2.5"/>EXPORT GPX</motion.button>
                       <motion.button whileTap={{scale:0.95}} onClick={placeTrailOnMap} disabled={!onPlaceOnMap} className="flex-1 py-1.5 rounded-lg text-[9px] font-mono font-bold tracking-wider flex items-center justify-center gap-1 disabled:opacity-30" style={{background:'rgba(0,230,255,0.06)',color:'var(--cyan-primary)',border:'1px solid rgba(0,230,255,0.08)'}}><MapPin className="w-2.5 h-2.5"/>ON MAP</motion.button>
                     </div>
