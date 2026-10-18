@@ -14,7 +14,7 @@ import {
   MapPin, Download, Upload, Database, Crosshair, Navigation,
   Wifi, Globe, Target, Activity, Shield
 } from 'lucide-react';
-import { summarizeTrail, shouldLogFix, toGPX, parseGPX, formatDistance, formatDuration, type GpsFix } from '@/lib/gps-trail';
+import { summarizeTrail, shouldLogFix, toGPX, parseGPX, sampleTrail, plotTrail, formatDistance, formatDuration, type GpsFix } from '@/lib/gps-trail';
 
 /* ═══════════════════════════════════════════════════════════════
    M A R A U D E R   V 8
@@ -141,6 +141,8 @@ export default function WorldRemote({onClose,onPlaceOnMap}:{onClose?:()=>void,on
   const [vaultLoaded,setVaultLoaded]=useState(false);
   const [gpsTrail,setGpsTrail]=useState<GeoFix[]>([]);
   const [gpsTracking,setGpsTracking]=useState(false);
+  const [replayMs,setReplayMs]=useState(0);
+  const [replaying,setReplaying]=useState(false);
 
   const mtd=useRef(true);const errT=useRef<ReturnType<typeof setTimeout>|null>(null);
   const nL=useRef<Map<string,(e:Event)=>void>>(new Map());const pid=useRef(0);
@@ -314,7 +316,7 @@ export default function WorldRemote({onClose,onPlaceOnMap}:{onClose?:()=>void,on
   const startGPSTrack=useCallback(()=>{
     if(gpsTracking)return;
     if(typeof navigator==='undefined'||!navigator.geolocation){setErr('This browser has no geolocation');return;}
-    setGpsTracking(true);gpsLogFix.current=null;
+    setGpsTracking(true);gpsLogFix.current=null;setReplaying(false);setReplayMs(0);
     log('GPS','TRACKER','══ GPS TRAIL ══ watching position');
     gpsWatch.current=navigator.geolocation.watchPosition(pos=>{
       if(!mtd.current)return;
@@ -345,7 +347,7 @@ export default function WorldRemote({onClose,onPlaceOnMap}:{onClose?:()=>void,on
       const {fixes,skipped}=parseGPX(await file.text());
       if(fixes.length===0){setErr('GPX: no track points found');log('ERROR','TRACKER',`GPX import failed — no track points in "${file.name}"`);return;}
       const capped=fixes.length>GPS_TRAIL_MAX?fixes.slice(fixes.length-GPS_TRAIL_MAX):fixes;
-      gpsTrailRef.current=capped;gpsLogFix.current=null;setGpsTrail(capped);
+      gpsTrailRef.current=capped;gpsLogFix.current=null;setGpsTrail(capped);setReplaying(false);setReplayMs(0);
       const s=summarizeTrail(capped);
       log('GPS','TRACKER',`══ GPX IMPORTED — "${file.name}" · ${s.fixes} fix${s.fixes===1?'':'es'} · ${formatDistance(s.distanceM)} · ${formatDuration(s.durationMs)}${skipped>0?` · ${skipped} skipped`:''}`);
     }catch(e:any){setErr(`GPX: ${e?.message||'unreadable'}`);log('ERROR','TRACKER',`GPX import failed: ${e?.message||'unreadable'}`);}
@@ -387,6 +389,19 @@ export default function WorldRemote({onClose,onPlaceOnMap}:{onClose?:()=>void,on
   const geoCount=devices.filter(d=>d.geo).length;
   const gpsStats=useMemo(()=>summarizeTrail(gpsTrail),[gpsTrail]);
   const lastFix=gpsTrail.length>0?gpsTrail[gpsTrail.length-1]:null;
+  const replaySample=useMemo(()=>sampleTrail(gpsTrail,replayMs),[gpsTrail,replayMs]);
+  const trailPlot=useMemo(()=>plotTrail(gpsTrail),[gpsTrail]);
+  const replayDot=replaySample?trailPlot.project(replaySample.lat,replaySample.lng):null;
+  const replayActive=replaying&&replayMs<gpsStats.durationMs;
+
+  // Replay clock: 100 ms ticks keep the dot moving. Reaching the end simply
+  // reads as "not active", so the clock stops without another state update.
+  useEffect(()=>{
+    if(!replayActive)return;
+    const dur=gpsStats.durationMs;
+    const iv=setInterval(()=>{setReplayMs(prev=>Math.min(dur,prev+100));},100);
+    return()=>clearInterval(iv);
+  },[replayActive,gpsStats.durationMs]);
 
   /* ═══════════════════════════════════════════════════════════════
      R E N D E R
@@ -571,6 +586,20 @@ export default function WorldRemote({onClose,onPlaceOnMap}:{onClose?:()=>void,on
                     <div className="flex gap-3 flex-wrap">
                       {[{l:'FIXES',v:String(gpsStats.fixes)},{l:'DIST',v:formatDistance(gpsStats.distanceM)},{l:'TIME',v:formatDuration(gpsStats.durationMs)},{l:'MAX',v:`${(gpsStats.maxSpeedMps*3.6).toFixed(1)}km/h`}].map(x=><div key={x.l}><div className="text-[9px] font-mono text-[var(--text-muted)] tracking-wider">{x.l}</div><div className="text-[10px] font-mono text-[var(--text-primary)] font-bold">{x.v}</div></div>)}
                     </div>
+                    {gpsTrail.length>1&&gpsStats.durationMs>0&&!gpsTracking&&<div className="space-y-1.5">
+                      <svg viewBox="0 0 100 40" className="w-full h-24 block rounded-lg" style={{background:'rgba(0,0,0,0.25)',border:'1px solid rgba(255,255,255,0.03)'}} aria-label="Trail preview">
+                        <polyline points={trailPlot.points} fill="none" stroke="rgba(255,183,77,0.5)" strokeWidth="1" strokeLinejoin="round" strokeLinecap="round"/>
+                        {replayDot&&<circle cx={replayDot.x} cy={replayDot.y} r="2" fill="#FFB74D"/>}
+                      </svg>
+                      <div className="flex items-center gap-1.5">
+                        <motion.button whileTap={{scale:0.95}} onClick={()=>{if(replayActive){setReplaying(false);}else{if(replayMs>=gpsStats.durationMs)setReplayMs(0);setReplaying(true);}}} className="w-6 h-6 rounded flex items-center justify-center shrink-0" style={{background:'rgba(255,183,77,0.06)',color:'#FFB74D',border:'1px solid rgba(255,183,77,0.08)'}} aria-label={replayActive?'Pause replay':'Play replay'}>{replayActive?<Pause className="w-2.5 h-2.5"/>:<Play className="w-2.5 h-2.5"/>}</motion.button>
+                        <input type="range" min={0} max={gpsStats.durationMs} step={100} value={Math.min(replayMs,gpsStats.durationMs)} onChange={e=>{setReplaying(false);setReplayMs(Number(e.target.value));}} className="flex-1 min-w-0 accent-[#FFB74D] cursor-pointer" aria-label="Trail replay position"/>
+                      </div>
+                      <div className="flex items-center justify-between text-[9px] font-mono">
+                        <span className="text-[var(--text-muted)] tracking-wider">{formatDuration(replayMs)} / {formatDuration(gpsStats.durationMs)}</span>
+                        {replaySample&&<span className="text-[#FFB74D]">{replaySample.lat.toFixed(5)}, {replaySample.lng.toFixed(5)}{replaySample.speed!=null?` · ${(replaySample.speed*3.6).toFixed(1)}km/h`:''}</span>}
+                      </div>
+                    </div>}
                     <div className="flex gap-1.5">
                       <motion.button whileTap={{scale:0.95}} onClick={()=>gpsFileRef.current?.click()} disabled={gpsTracking} className="flex-1 py-1.5 rounded-lg text-[9px] font-mono font-bold tracking-wider flex items-center justify-center gap-1 disabled:opacity-30" style={{background:'rgba(255,183,77,0.06)',color:'#FFB74D',border:'1px solid rgba(255,183,77,0.08)'}}><Upload className="w-2.5 h-2.5"/>IMPORT</motion.button>
                       <motion.button whileTap={{scale:0.95}} onClick={exportGPX} className="flex-1 py-1.5 rounded-lg text-[9px] font-mono font-bold tracking-wider flex items-center justify-center gap-1" style={{background:'rgba(255,183,77,0.06)',color:'#FFB74D',border:'1px solid rgba(255,183,77,0.08)'}}><Download className="w-2.5 h-2.5"/>EXPORT GPX</motion.button>
