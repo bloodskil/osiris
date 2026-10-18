@@ -2008,7 +2008,7 @@ export default function Dashboard() {
                   setScanTargets(prev => {
                     const ids = new Set(prev.map((t: any) => t.id));
                     const next = [...prev];
-                    devs.forEach(d => { if (!ids.has(d.id)) next.unshift({ id: d.id, name: d.name, lat: d.lat, lng: d.lng, type: d.type, color: d.color, timestamp: Date.now(), source: 'BLE' }); });
+                    devs.forEach(d => { if (!ids.has(d.id)) next.unshift({ id: d.id, name: d.name, lat: d.lat, lng: d.lng, type: d.type, color: d.color, timestamp: Date.now(), source: d.source ?? 'BLE' }); });
                     return next.slice(0, 20);
                   });
                   if (devs.length > 0) setFlyToLocation({ lat: devs[0].lat, lng: devs[0].lng, ts: Date.now() });
@@ -2223,7 +2223,7 @@ export default function Dashboard() {
                       setScanTargets(prev => {
                         const ids = new Set(prev.map((t: any) => t.id));
                         const next = [...prev];
-                        devs.forEach(d => { if (!ids.has(d.id)) next.unshift({ id: d.id, name: d.name, lat: d.lat, lng: d.lng, type: d.type, color: d.color, timestamp: Date.now(), source: 'BLE' }); });
+                        devs.forEach(d => { if (!ids.has(d.id)) next.unshift({ id: d.id, name: d.name, lat: d.lat, lng: d.lng, type: d.type, color: d.color, timestamp: Date.now(), source: d.source ?? 'BLE' }); });
                         return next.slice(0, 20);
                       });
                       if (devs.length > 0) setFlyToLocation({ lat: devs[0].lat, lng: devs[0].lng, ts: Date.now() });
